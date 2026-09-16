@@ -563,9 +563,20 @@ class AIAgent(
         if uses_implicit_default and base_url and is_local_endpoint(base_url):
             return float("inf")
 
-        from agent.chat_completion_helpers import estimate_request_context_tokens
+        from agent.chat_completion_helpers import (
+            _reasoning_effort_scaled_timeout,
+            estimate_request_context_tokens,
+        )
         est_tokens = estimate_request_context_tokens(api_payload)
         timeout = max(stale_base, 240.0) if est_tokens > 100_000 else max(stale_base, 150.0) if est_tokens > 50_000 else stale_base
+        # Reasoning-effort scaling (#112909): on non-streaming calls a
+        # high/xhigh GPT-5-family model emits zero bytes until it finishes
+        # thinking (routinely 100-170s), which the 90s implicit default kills
+        # as "stale" on every retry. Symmetric with the stream watchdogs in
+        # _resolve_nonstream_watchdogs; only high/xhigh scale, so low/medium/
+        # none/absent keep the timeout bit-identical.
+        timeout = _reasoning_effort_scaled_timeout(
+            timeout, api_payload, self, "HERMES_API_CALL_STALE_REASONING_MULTIPLIER")
         # Run-budget cap: an implicit stale timeout is capped at half the remaining budget (>= 60s) so one
         # hung call cannot eat the run. Never raises the timeout; explicit user config still wins.
         run_budget = getattr(self, "run_budget_seconds", None)

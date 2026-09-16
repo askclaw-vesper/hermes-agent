@@ -1084,6 +1084,47 @@ class _RequestClientRegistry:
             self.agent._close_request_openai_client(request_client, reason=reason)
 
 
+def _reasoning_effort_level(api_payload, agent=None) -> str:
+    """Normalized reasoning effort, preferring the wire-bound payload.
+
+    ``api_payload['reasoning']['effort']`` (Responses API) and
+    ``api_payload['reasoning_effort']`` (Chat Completions) are what the server
+    will actually see; ``agent.reasoning_config`` is only a fallback because
+    several call paths (oneshot, cron, default chat) never populate it.
+    """
+    effort = ""
+    if isinstance(api_payload, dict):
+        reasoning = api_payload.get("reasoning")
+        if isinstance(reasoning, dict):
+            effort = str(reasoning.get("effort") or "").strip().lower()
+        if not effort:
+            effort = str(api_payload.get("reasoning_effort") or "").strip().lower()
+    if not effort and agent is not None:
+        reasoning_config = getattr(agent, "reasoning_config", None)
+        if isinstance(reasoning_config, dict):
+            effort = str(reasoning_config.get("effort") or "").strip().lower()
+    return effort
+
+
+def _reasoning_effort_scaled_timeout(timeout: float, api_payload, agent, env_name: str) -> float:
+    """Scale a watchdog timeout for high/xhigh reasoning effort.
+
+    GPT-5-family models at ``reasoning_effort=high|xhigh`` routinely spend
+    100-170s in silent server-side thinking before the first byte, so fuses
+    calibrated for default effort kill healthy calls. Only high/xhigh scale;
+    low/medium/none/absent keep the timeout bit-identical (zero behavior
+    change). The env var (default 5.0) tunes or disables (<=1) the multiplier.
+    """
+    if timeout <= 0:
+        return timeout
+    if _reasoning_effort_level(api_payload, agent) not in {"high", "xhigh"}:
+        return timeout
+    multiplier = env_float(env_name, 5.0)
+    if multiplier > 1.0:
+        return timeout * multiplier
+    return timeout
+
+
 @dataclass
 class _NonStreamWatchdogs:
     """Poll-loop thresholds for one non-streaming request."""
@@ -1132,6 +1173,14 @@ def _resolve_nonstream_watchdogs(agent, api_kwargs: dict) -> _NonStreamWatchdogs
     idle_default = next(
         (default for threshold, default in ((100_000, 180.0), (50_000, 120.0), (10_000, 60.0)) if est_tokens > threshold),
         12.0)
+    # Reasoning-effort scaling (#112909): the token tiers were calibrated for
+    # default-effort calls. high/xhigh reasoning spends 100-170s in silent
+    # server-side thinking before the first SSE event, far past the 12s
+    # small-prompt fuse, so the watchdog executes a healthy model for thinking
+    # quietly. Scale the tier default; an explicit
+    # HERMES_CODEX_EVENT_STALE_TIMEOUT_SECONDS still wins outright below.
+    idle_default = _reasoning_effort_scaled_timeout(
+        idle_default, api_kwargs, agent, "HERMES_CODEX_HIGH_EFFORT_MULTIPLIER")
 
     # No-event TTFB cutoff. Default 120s: the SDK's own read timeout is 600s,
     # and a tight 12s killed subscription-backed requests mid-prefill.
@@ -1156,6 +1205,14 @@ def _resolve_nonstream_watchdogs(agent, api_kwargs: dict) -> _NonStreamWatchdogs
                 "(context=~%s tokens). Set HERMES_CODEX_TTFB_MAX_SECONDS to tune.", ttfb_timeout, ttfb_cap,
                 f"{est_tokens:,}")
             ttfb_timeout = ttfb_cap
+    # Reasoning-effort scaling applies AFTER the prefill-size cap: the cap bounds
+    # how long we wait for a large request's admission, not how long a
+    # high-effort model may think silently before its first event (#112909 —
+    # with the default 120s cap, env tuning alone could never reach the 600s a
+    # high-effort call legitimately needs).
+    if ttfb_enabled:
+        ttfb_timeout = _reasoning_effort_scaled_timeout(
+            ttfb_timeout, api_kwargs, agent, "HERMES_CODEX_HIGH_EFFORT_MULTIPLIER")
 
     # An operator-set idle timeout keeps first-event semantics; only the implicit
     # default defers arming until model progress. Sentinel: env_float returns the
